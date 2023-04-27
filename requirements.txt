@@ -1,3 +1,7 @@
 torch
 torchaudio
 sounddevice
+numpy
+omegaconf
+sentencepiece
+soundfile

@@ -1,5 +1,5 @@
+#!/usr/bin/env python3
 import argparse
-import telnetlib
 import time
 import random
 import datetime
@@ -7,8 +7,13 @@ import glob
 import os
 import csv
 from pathlib import Path
+import socket
 
-VERSION = '1.0.1'
+__author__ = 'Ryan Clouser'
+__copyright__ = 'Copyright (c) Ryan Clouser 2023'
+__license__ = 'MIT'
+__version__ = '1.1.0'
+
 
 AM_START = 540000
 AM_END = 1700000
@@ -18,72 +23,138 @@ FM_START = 88100000
 FM_END = 108000000
 FM_STEP = 200000
 
-WAV_PATH = os.path.join(Path.home(), 'gqrx_*.wav')
-
 
 try:
 	import torch
 	import torchaudio
+	from torchaudio.io import StreamReader
 	import torch.multiprocessing as mp
 	import sounddevice as sd
 
-	bundle = torchaudio.pipelines.WAV2VEC2_ASR_BASE_960H
-	device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-	model = bundle.get_model().to(device)
-	resampler = torchaudio.transforms.Resample(48_000, 16_000)
+	backend = 'cpu'
+	if torch.cuda.is_available():
+		backend = 'cuda'
+	elif torch.backends.mps.is_available():
+		backend = 'mps'
 
+	device = torch.device(backend)
 	tts_model = torch.hub.load(repo_or_dir='snakers4/silero-models', model='silero_tts', language='en', speaker='v3_en', verbose=False)[0]
 	tts_model.to(device)
+
 	TORCH = True
-except Exception as e:
+except ImportError as e:
 	TORCH = False
 	print(e)
 
 
-# https://pytorch.org/audio/main/tutorials/asr_inference_with_ctc_decoder_tutorial.html
-class GreedyCTCDecoder(torch.nn.Module):
-	def __init__(self, labels, blank=0):
-		super().__init__()
-		self.labels = labels
-		self.blank = blank
+class Pipeline:
+	"""Build inference pipeline from RNNTBundle.
 
-	def forward(self, emission: torch.Tensor) -> list[str]:
-		"""Given a sequence emission over labels, get the best path
-		Args:
-		emission (Tensor): Logit tensors. Shape `[num_seq, num_label]`.
+	Args:
+		bundle (torchaudio.pipelines.RNNTBundle): Bundle object
+		beam_width (int): Beam size of beam search decoder.
+	"""
 
-		Returns:
-		List[str]: The resulting transcript
-		"""
-		indices = torch.argmax(emission, dim=-1)  # [num_seq,]
-		indices = torch.unique_consecutive(indices, dim=-1)
-		indices = [i for i in indices if i != self.blank]
-		joined = ''.join([self.labels[i] for i in indices])
-		return joined.replace('|', ' ').strip().lower().split()
+	def __init__(self, bundle: torchaudio.pipelines.RNNTBundle, beam_width: int = 10):
+		self.bundle = bundle
+		self.feature_extractor = bundle.get_streaming_feature_extractor()
+		self.decoder = bundle.get_decoder()
+		self.token_processor = bundle.get_token_processor()
 
+		self.beam_width = beam_width
 
-def infer(path):
-	waveform, sample_rate = torchaudio.load(path)
-	waveform = resampler(waveform).squeeze()
+		self.state = None
+		self.hypothesis = None
 
-	with torch.inference_mode():
-		features, _ = model.extract_features(waveform)
-	with torch.inference_mode():
-		emission, _ = model(waveform)
-
-	decoder = GreedyCTCDecoder(labels=bundle.get_labels())
-	return decoder(emission[0])
+	def infer(self, segment: torch.Tensor) -> str:
+		"""Perform streaming inference"""
+		features, length = self.feature_extractor(segment)
+		hypos, self.state = self.decoder.infer(
+			features, length, self.beam_width, state=self.state, hypothesis=self.hypothesis
+		)
+		self.hypothesis = hypos[0]
+		return self.token_processor(self.hypothesis[0]).strip()
 
 
-def tts(text, blocking=True):
+class ContextCacher:
+	"""Cache the end of input data and prepend the next input data with it.
+
+	Args:
+		segment_length (int): The size of main segment.
+		If the incoming segment is shorter, then the segment is padded.
+		context_length (int): The size of the context, cached and appended.
+	"""
+
+	def __init__(self, segment_length: int, context_length: int):
+		self.segment_length = segment_length
+		self.context_length = context_length
+		self.context = torch.zeros([context_length])
+
+	def __call__(self, chunk: torch.Tensor):
+		if chunk.size(0) < self.segment_length:
+			chunk = torch.nn.functional.pad(chunk, (0, self.segment_length - chunk.size(0)))
+		chunk_with_context = torch.cat((self.context, chunk))
+		self.context = chunk[-self.context_length :]
+		return chunk_with_context
+
+
+class UDPWrapper:
+	def __init__(self, obj):
+		self.obj = obj
+
+	def read(self, n):
+		return self.obj.recvfrom(n)[0]
+
+
+def stream(q, ip, segment_length, sample_rate):
+	s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+	while True:
+		try:
+			s.bind((ip, 7355))
+			break
+		except Exception as e:
+			print(e)
+			time.sleep(2)
+
+	streamer = StreamReader(UDPWrapper(s), format='s16le')
+	streamer.add_basic_audio_stream(frames_per_chunk=segment_length, sample_rate=sample_rate)
+
+	stream_iterator = streamer.stream(timeout=-1, backoff=1.0)
+	while True:
+		(chunk,) = next(stream_iterator)
+		q.put(chunk)
+
+
+def tts(q, reverb):
 	sample_rate = 48000
 	speaker = 'en_0'
 
-	audio = tts_model.apply_tts(text=text, speaker=speaker, sample_rate=sample_rate)
-	sd.play(audio, sample_rate, blocking=blocking)
+	# https://pytorch.org/audio/main/tutorials/audio_data_augmentation_tutorial.html
+	effects = [
+		["speed", "0.90"],
+		["rate", f"{sample_rate}"]
+	]
+
+	if reverb:
+		effects.append(["reverb", "-w"])
+
+	while True:
+		text = q.get()
+		audio = tts_model.apply_tts(text=','.join(text) + '.', speaker=speaker, sample_rate=sample_rate)
+		audio = torchaudio.sox_effects.apply_effects_tensor(audio.unsqueeze(0), sample_rate, effects)[0]
+		sd.play(audio[0], sample_rate, blocking=True)
 
 
-def process(q, use_wordlist, use_tts):
+def process(ip, use_wordlist, use_tts, long_words, reverb):
+	bundle = torchaudio.pipelines.EMFORMER_RNNT_BASE_LIBRISPEECH
+
+	sample_rate = bundle.sample_rate
+	segment_length = bundle.segment_length * bundle.hop_length
+	context_length = bundle.right_context_length * bundle.hop_length
+	pipeline = Pipeline(bundle)
+
+	cacher = ContextCacher(segment_length, context_length)
+
 	words = []
 	if use_wordlist:
 		try:
@@ -94,45 +165,70 @@ def process(q, use_wordlist, use_tts):
 		except Exception as e:
 			print(e)
 
-	while True:
-		f = q.get()
-		result = infer(f)
-		data = []
+	ctx = mp.get_context("spawn")
+	q = ctx.Queue()
+	p1 = ctx.Process(target=stream, args=(q, ip, segment_length, sample_rate))
+	p1.start()
 
-		for word in result:
-			if not words or word in words:
-				data.append(word)
+	tts_q = ctx.Queue()
+	p2 = ctx.Process(target=tts, args=(tts_q, reverb))
+	p2.start()
 
-		if data:
-			print('{} -> {}'.format(datetime.datetime.now(), ' '.join(data)))
-			if use_tts:
-				tts('.'.join(data) + '.')
+	@torch.inference_mode()
+	def infer():
+		t = 0.0
+		sentence = []
+		while True:
+			chunk = q.get()
+			segment = cacher(chunk[:, 0])
+			transcript = pipeline.infer(segment)
+			if transcript:
+				if not words or transcript in words:
+					t = time.time()
+					sentence.append(transcript)
+			if sentence and time.time() - t > 2.5:
+				if long_words:
+					sentence = [word for word in sentence if len(word) > 2]
+				if sentence:
+					if use_tts:
+						tts_q.put(sentence)
+					print('{} -> {}'.format(datetime.datetime.now(), ' '.join(sentence)))
+					sentence = []
 
-		os.remove(f)
+	infer()
+	p1.join()
+	p2.join()
 
 
 class Ghostbox:
 	def __init__(self, ip, port):
-		self.tn = telnetlib.Telnet(ip, port)
+		self.s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+		while True:
+			try:
+				self.s.connect((ip, port))
+				break
+			except Exception as e:
+				print(e)
+				time.sleep(2.0)
 
-	def _write(self, msg):
-		self.tn.write(msg.encode('ascii'))
-		return self.tn.read_some().decode('ascii').strip()
+	def __write(self, msg):
+		self.s.send(msg.encode('ascii'))
+		return self.s.recv(1024).decode('ascii').strip()
 
 	def set_squelch(self, sql):
-		return self._write('L SQL {}\n'.format(sql))
+		return self.__write('L SQL {}\n'.format(sql))
 
 	def set_freq(self, freq):
-		return self._write('F {}\n'.format(freq))
+		return self.__write('F {}\n'.format(freq))
 
 	def set_mode(self, mode):
-		return self._write('M {}\n'.format(mode))
+		return self.__write('M {}\n'.format(mode))
 
 	def set_record(self, mode):
-		return self._write('U RECORD {}\n'.format(mode))
+		return self.__write('U RECORD {}\n'.format(mode))
 
 	def get_strength(self):
-		return float(self._write('l\n'))
+		return float(self.__write('l\n'))
 
 
 def gb_freq(gb, freq, mode=None):
@@ -142,36 +238,35 @@ def gb_freq(gb, freq, mode=None):
 
 
 def main():
-	parser = argparse.ArgumentParser(description='Python Ghostbox')
-	parser.add_argument('--version', action='store_true', help='Version')
-	parser.add_argument('--ip', type=str, default='127.0.0.1', help='GQRX IP')
-	parser.add_argument('--port', type=int, default=7356, help='GQRX port')
-	parser.add_argument('--fm', action='store_true', help='Enable FM radio scanning')
-	parser.add_argument('--am', action='store_true', help='Enable AM radio scanning')
-	parser.add_argument('--speed', type=int, default=150, help='Scanning speed in milliseconds')
-	parser.add_argument('--squelch', type=int, default=-30, help='Squelch')
-	parser.add_argument('--random', action='store_true', help='Random scanning')
-	parser.add_argument('--forward', action='store_true', help='Forward scanning')
-	parser.add_argument('--backward', action='store_true', help='Backward scanning')
-	parser.add_argument('--bounce', action='store_true', default=True, help='Bounce scanning')
-	parser.add_argument('--record', action='store_true', help='Record and process audio')
-	parser.add_argument('--record-interval', type=float, default=5.0, help='Time for each audio recording')
-	parser.add_argument('--wordlist', action='store_true', help='Use a wordlist after audio is processed')
-	parser.add_argument('--tts', action='store_true', help='Use text to speech')
+	parser = argparse.ArgumentParser(description='Ghostbox')
+	parser.add_argument('-v', '--version', action='store_true', help='display the program version')
+	parser.add_argument('--ip', type=str, default='127.0.0.1', help='gqrx IP')
+	parser.add_argument('-p', '--port', type=int, default=7356, help='gqrx port')
+	parser.add_argument('--fm', action='store_true', help='enable FM radio scanning')
+	parser.add_argument('--am', action='store_true', help='enable AM radio scanning')
+	parser.add_argument('-i', '--interval', type=float, default=0.15, help='scanning interval in seconds')
+	parser.add_argument('-s', '--squelch', type=int, default=-45, help='squelch')
+	parser.add_argument('--random', action='store_true', help='random scanning')
+	parser.add_argument('--forward', action='store_true', help='forward scanning')
+	parser.add_argument('--backward', action='store_true', help='backward scanning')
+	parser.add_argument('--bounce', action='store_true', default=True, help='bounce scanning')
+	parser.add_argument('--stt', action='store_true', help='enable speech to text')
+	parser.add_argument('-w', '--wordlist', action='store_true', help='use a wordlist after audio is processed')
+	parser.add_argument('--tts', action='store_true', help='enable text to speech')
+	parser.add_argument('-r', '--reverb', action='store_true', help='apply reverb effect to TTS')
+	parser.add_argument('-l', '--long-words', action='store_true', help='hide short words from the output')
 	args = parser.parse_args()
 
 	if args.version:
-		print(VERSION)
+		print(__version__)
 		return
 
 	if not args.am and not args.fm:
 		print('Error: AM/FM frequencies not enabled')
 		return
 
-	if args.speed < 0:
-		print('Error: Invalid scan speed')
-	elif args.speed > 0:
-		args.speed /= 1000
+	if args.interval < 0:
+		print('Error: Invalid scan interval')
 
 	print("   _____ _               _   _               ")
 	print("  / ____| |             | | | |              ")
@@ -179,7 +274,7 @@ def main():
 	print(" | | |_ | '_ \\ / _ \\/ __| __| '_ \\ / _ \\ \\/ /")
 	print(" | |__| | | | | (_) \\__ \\ |_| |_) | (_) >  < ")
 	print("  \\_____|_| |_|\\___/|___/\\__|_.__/ \\___/_/\\_\\\n")
-	print('v{}\n'.format(VERSION))
+	print('v{}\n'.format(__version__))
 
 	if args.am and args.fm:
 		print('- AM/FM enabled')
@@ -197,20 +292,20 @@ def main():
 	else:
 		print('- Bounce')
 
-	if args.speed > 0:
-		print('- {}s interval'.format(args.speed))
+	if args.interval > 0:
+		print('- {}s interval'.format(args.interval))
 	else:
 		print('- Random interval')
 
 	print('- {}dB squelch'.format(args.squelch))
 
-	if args.record:
-		if TORCH:
-			print('- Recording')
-			print('- {}s record interval'.format(args.record_interval))
-		else:
-			args.record = False
-			print('Torch is not installed, cannot process recordings')
+	if TORCH:
+		if args.stt:
+			print('- Speech to Text')
+			if args.tts:
+				print('- Text to Speech')
+			if args.long_words:
+				print('- Hide short words')
 
 	print()
 
@@ -234,10 +329,9 @@ def main():
 		else:
 			gb.set_mode('WFM')
 
-	if args.record:
+	if args.stt:
 		ctx = mp.get_context('spawn')
-		q = ctx.Queue()
-		p = ctx.Process(target=process, args=(q, args.wordlist, args.tts))
+		p = ctx.Process(target=process, args=(args.ip, args.wordlist, args.tts, args.long_words, args.reverb))
 		p.start()
 
 	start = datetime.datetime.now()
@@ -247,16 +341,6 @@ def main():
 		freq = 0
 		index = 0
 		direction = 1
-
-		if args.record:
-			gb.set_record(0)
-			for f in glob.glob(WAV_PATH):
-				print('Removing {}'.format(f))
-				os.remove(f)
-			print()
-
-			record_start = time.time()
-			gb.set_record(1)
 
 		while True:
 			if args.random:
@@ -277,26 +361,18 @@ def main():
 				freq = frequencies[index]
 				index += direction
 
-			if args.record and time.time() - record_start >= args.record_interval:
-				gb.set_record(0)
-				files = glob.glob(WAV_PATH)
-				files.sort(key=os.path.getmtime)
-				q.put(files[-1])
-				record_start = time.time()
-				gb.set_record(1)
-
 			if freq < FM_START:
 				gb_freq(gb, freq, 'AM' if mode else None)
 			else:
 				gb_freq(gb, freq, 'WFM' if mode else None)
 
 			if args.random:
-				time.sleep(args.speed / 2)
+				time.sleep(args.interval / 2)
 				# spooooky
 				random.seed(gb.get_strength())
-				time.sleep(args.speed / 2)
-			elif args.speed > 0:
-				time.sleep(args.speed)
+				time.sleep(args.interval / 2)
+			elif args.interval > 0:
+				time.sleep(args.interval)
 			else:
 				time.sleep(0.5 + gb.get_strength() / 100)
 	except KeyboardInterrupt:
@@ -306,7 +382,7 @@ def main():
 	print('Ended @ {}\n'.format(end))
 	print('Runtime {}'.format(end - start))
 
-	if args.record:
+	if args.stt:
 		p.join()
 
 
