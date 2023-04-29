@@ -41,7 +41,7 @@ Usage
 
 ```
 usage: ghostbox.py [-h] [-v] [--ip IP] [-p PORT] [--fm] [--am] [-i INTERVAL] [-s SQUELCH] [--random] [--forward]
-                   [--backward] [--bounce] [--stt] [-w] [--tts] [-r] [-l]
+                   [--backward] [--bounce] [--stt] [-w] [--tts] [-r] [-l] [-pb] [-ps PLAYBACK_SPEED]
 
 Ghostbox
 
@@ -65,6 +65,9 @@ options:
   --tts                 enable text to speech
   -r, --reverb          apply reverb effect to TTS
   -l, --long-words      hide short words from the output
+  -pb, --playback       playback transcript audio
+  -ps PLAYBACK_SPEED, --playback-speed PLAYBACK_SPEED
+                        playback speed
 ```
 
 Speech to Text
@@ -95,12 +98,23 @@ If you get an error about libxml2, just ignore it and copy the `GQRX.app` file t
 
 - https://gist.github.com/Forst/db68106136be3380086e3c38be094d99
 
+GQRX
+---
+
+- Disable Hardware AGC
+- Gain 0.0 dB
+
 Wordlist
 ---
 
 Top 5000 common English words.
 
 - https://github.com/filiph/english_words/
+
+TimeseriesCache
+---
+
+- https://gist.github.com/jamesp/1385745/4736616d10551a6abc9c7c58725ee5b2f8de9f4d
 
 Errors
 ---

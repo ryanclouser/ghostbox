@@ -8,11 +8,12 @@ import os
 import csv
 from pathlib import Path
 import socket
+from TimeseriesCache import TimeseriesCache
 
 __author__ = 'Ryan Clouser'
 __copyright__ = 'Copyright (c) Ryan Clouser 2023'
 __license__ = 'MIT'
-__version__ = '1.1.0'
+__version__ = '1.1.1'
 
 
 AM_START = 540000
@@ -120,9 +121,13 @@ def stream(q, ip, segment_length, sample_rate):
 	streamer.add_basic_audio_stream(frames_per_chunk=segment_length, sample_rate=sample_rate)
 
 	stream_iterator = streamer.stream(timeout=-1, backoff=1.0)
-	while True:
-		(chunk,) = next(stream_iterator)
-		q.put(chunk)
+
+	try:
+		while True:
+			(chunk,) = next(stream_iterator)
+			q.put(chunk)
+	except KeyboardInterrupt:
+		pass
 
 
 def tts(q, reverb):
@@ -138,14 +143,35 @@ def tts(q, reverb):
 	if reverb:
 		effects.append(["reverb", "-w"])
 
-	while True:
-		text = q.get()
-		audio = tts_model.apply_tts(text=','.join(text) + '.', speaker=speaker, sample_rate=sample_rate)
-		audio = torchaudio.sox_effects.apply_effects_tensor(audio.unsqueeze(0), sample_rate, effects)[0]
-		sd.play(audio[0], sample_rate, blocking=True)
+	try:
+		while True:
+			text = q.get()
+			audio = tts_model.apply_tts(text=','.join(text) + '.', speaker=speaker, sample_rate=sample_rate)
+			audio = torchaudio.sox_effects.apply_effects_tensor(audio.unsqueeze(0), sample_rate, effects)[0]
+			sd.play(audio[0], sample_rate, blocking=True)
+	except KeyboardInterrupt:
+		pass
 
 
-def process(ip, use_wordlist, use_tts, long_words, reverb):
+def playback(q, reverb, speed, sample_rate):
+	effects = [
+		["speed", f"{speed}"],
+		["rate", f"{sample_rate}"]
+	]
+
+	if reverb:
+		effects.append(["reverb", "-w"])
+
+	try:
+		while True:
+			waveform = q.get()
+			audio = torchaudio.sox_effects.apply_effects_tensor(waveform.unsqueeze(0), sample_rate, effects)[0]
+			sd.play(audio[0], sample_rate, blocking=True)
+	except KeyboardInterrupt:
+		pass
+
+
+def process(ip, interval, use_wordlist, use_tts, long_words, reverb, use_playback, playback_speed):
 	bundle = torchaudio.pipelines.EMFORMER_RNNT_BASE_LIBRISPEECH
 
 	sample_rate = bundle.sample_rate
@@ -166,38 +192,59 @@ def process(ip, use_wordlist, use_tts, long_words, reverb):
 			print(e)
 
 	ctx = mp.get_context("spawn")
-	q = ctx.Queue()
-	p1 = ctx.Process(target=stream, args=(q, ip, segment_length, sample_rate))
+	q1 = ctx.Queue()
+	p1 = ctx.Process(target=stream, args=(q1, ip, segment_length, sample_rate))
 	p1.start()
 
-	tts_q = ctx.Queue()
-	p2 = ctx.Process(target=tts, args=(tts_q, reverb))
-	p2.start()
+	if use_tts:
+		q2 = ctx.Queue()
+		p2 = ctx.Process(target=tts, args=(q2, reverb))
+		p2.start()
+	elif use_playback:
+		q2 = ctx.Queue()
+		p2 = ctx.Process(target=playback, args=(q2, reverb, playback_speed, sample_rate))
+		p2.start()
 
 	@torch.inference_mode()
 	def infer():
+		c = TimeseriesCache(ttl=10.0)
+		start = 0.0
 		t = 0.0
 		sentence = []
-		while True:
-			chunk = q.get()
-			segment = cacher(chunk[:, 0])
-			transcript = pipeline.infer(segment)
-			if transcript:
-				if not words or transcript in words:
-					t = time.time()
-					sentence.append(transcript)
-			if sentence and time.time() - t > 2.5:
-				if long_words:
-					sentence = [word for word in sentence if len(word) > 2]
-				if sentence:
-					if use_tts:
-						tts_q.put(sentence)
-					print('{} -> {}'.format(datetime.datetime.now(), ' '.join(sentence)))
-					sentence = []
+
+		try:
+			while True:
+				chunk = q1.get()
+				segment = cacher(chunk[:, 0])
+				c.add(time.time(), segment)
+
+				transcript = pipeline.infer(segment)
+				if transcript:
+					if not words or transcript in words:
+						t = time.time()
+						if not start:
+							start = t
+						sentence.append(transcript)
+
+				if sentence and time.time() - t > 2.5:
+					if long_words:
+						sentence = [word for word in sentence if len(word) > 2]
+					if sentence:
+						if use_tts:
+							q2.put(sentence)
+						elif use_playback:
+							q2.put(torch.cat(c[start - interval:t + interval], dim=0))
+						print('{} -> {}'.format(datetime.datetime.now(), ' '.join(sentence)))
+						sentence = []
+						start = 0.0
+		except KeyboardInterrupt:
+			pass
 
 	infer()
+
 	p1.join()
-	p2.join()
+	if use_tts or use_playback:
+		p2.join()
 
 
 class Ghostbox:
@@ -255,6 +302,8 @@ def main():
 	parser.add_argument('--tts', action='store_true', help='enable text to speech')
 	parser.add_argument('-r', '--reverb', action='store_true', help='apply reverb effect to TTS')
 	parser.add_argument('-l', '--long-words', action='store_true', help='hide short words from the output')
+	parser.add_argument('-pb', '--playback', action='store_true', help='playback transcript audio')
+	parser.add_argument('-ps', '--playback-speed', type=float, default=1.0, help='playback speed')
 	args = parser.parse_args()
 
 	if args.version:
@@ -267,6 +316,11 @@ def main():
 
 	if args.interval < 0:
 		print('Error: Invalid scan interval')
+		return
+
+	if args.tts and args.playback:
+		print('Error: TTS and playback cannot both be enabled')
+		return
 
 	print("   _____ _               _   _               ")
 	print("  / ____| |             | | | |              ")
@@ -331,7 +385,7 @@ def main():
 
 	if args.stt:
 		ctx = mp.get_context('spawn')
-		p = ctx.Process(target=process, args=(args.ip, args.wordlist, args.tts, args.long_words, args.reverb))
+		p = ctx.Process(target=process, args=(args.ip, args.interval, args.wordlist, args.tts, args.long_words, args.reverb, args.playback, args.playback_speed))
 		p.start()
 
 	start = datetime.datetime.now()
